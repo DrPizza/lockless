@@ -81,6 +81,10 @@ namespace smr {
 		void* key;
 	};
 
+	// non-owning pointer that uses a hazard pointer to prevent the pointee from being
+	// deleted out from under us. While the raw pointer value is preserved, the hazard
+	// *target* is 16 byte aligned. I need the low bits to encode some data, but don't
+	// want that to interfere with hazard tracking.
 	template<typename T>
 	struct stable_pointer {
 		typedef T* pointer_type;
@@ -100,7 +104,7 @@ namespace smr {
 		my_type& operator=(T* volatile* location) {
 			for(;;) {
 				pointer = *location;
-				(*hazard)[0] = const_cast<bare_type*>(pointer);
+				(*hazard)[0] = align_pointer(const_cast<bare_type*>(pointer));
 				if(*location == pointer) {
 					break;
 				}
@@ -111,7 +115,7 @@ namespace smr {
 		// assign a pointer known to be unique and valid and/or persistent
 		void unshared_assign(pointer_type ptr) {
 			pointer = ptr;
-			(*hazard)[0] = ptr;
+			(*hazard)[0] = align_pointer(ptr);
 		}
 
 		pointer_type& get_pointer() {
@@ -141,32 +145,39 @@ namespace smr {
 		const_pointer_type operator->() const {
 			return pointer;
 		}
-
-		bool operator==(const my_type& rhs) {
+	
+		bool operator==(const my_type& rhs) const {
 			return pointer == rhs.pointer;
 		}
-
-		bool operator!=(const my_type& rhs) {
+	
+		bool operator!=(const my_type& rhs) const {
 			return !(*this == rhs);
 		}
-
-		bool operator==(std::nullptr_t) {
+	
+		bool operator==(std::nullptr_t) const {
 			return pointer == nullptr;
 		}
-
-		bool operator!=(std::nullptr_t) {
+	
+		bool operator!=(std::nullptr_t) const {
 			return !(pointer == nullptr);
 		}
-
-		bool operator==(pointer_type rhs) {
+	
+		bool operator==(const_pointer_type rhs) const {
 			return pointer == rhs;
 		}
 
-		bool operator!=(pointer_type rhs) {
+		bool operator!=(const_pointer_type rhs) const {
 			return !(pointer == rhs);
 		}
 
 	private:
+		bare_type* align_pointer(bare_type* p) const
+		{
+			size_t val = reinterpret_cast<size_t>(p);
+			val &= ~0xf;
+			return reinterpret_cast<bare_type*>(val);
+		}
+	
 		pointer_type pointer;
 		std::shared_ptr<hazard_pointers<1> > hazard;
 	};
@@ -195,22 +206,22 @@ namespace smr {
 	};
 
 	inline void smr_destroy(smr_destructible* s) {
-		detail::smr_free_with_finalizer(s, s->get_finalizer(), nullptr);
+		detail::smr_retire_with_finalizer(s, s->get_finalizer(), nullptr);
 	}
 
 	inline void smr_destroy(void* ptr) {
-		detail::smr_free(ptr);
+		detail::smr_retire(ptr);
 	}
 
 	typedef detail::finalizer_function_t finalizer_function_t;
 	inline void smr_destroy(void* ptr, finalizer_function_t fin, void* ctxt) {
-		detail::smr_free_with_finalizer(ptr, fin, ctxt);
+		detail::smr_retire_with_finalizer(ptr, fin, ctxt);
 	}
 
 	template<typename T>
 	inline void smr_destroy(const stable_pointer<T>& ptr, finalizer_function_t fin, void* ctxt) {
 		typedef typename std::remove_const<T>::type bare_type;
-		detail::smr_free_with_finalizer(const_cast<bare_type*>(ptr.get_pointer()), fin, ctxt);
+		detail::smr_retire_with_finalizer(const_cast<bare_type*>(ptr.get_pointer()), fin, ctxt);
 	}
 }
 

@@ -40,10 +40,10 @@ void delete_interlocked_queue(interlocked_queue_t* q)
 	{
 		q->value_destructor(value);
 	}
-	smr_free(q->head);
+	smr_retire(q->head);
 	q->head = nullptr;
 	q->tail = nullptr;
-	smr_free(q);
+	smr_retire(q);
 }
 
 void interlocked_queue_push(interlocked_queue_t* q, void* data)
@@ -133,7 +133,7 @@ bool interlocked_queue_pop(interlocked_queue_t* q, void** output)
 	}
 
 	h->next = nullptr;
-	smr_free(h);
+	smr_retire(h);
 	if(output) { *output = data; }
 	deallocate_hazard_pointers(key);
 	return data != nullptr;

@@ -57,34 +57,33 @@
 // 
 // <p> Like {@link Hashtable} but unlike {@link HashMap}, this class
 // does <em>not</em> allow <tt>null</tt> to be used as a key or value.
-template<typename K, typename V, typename H = std::hash<K>, typename KE = std::equal_to<K>, typename VE = std::equal_to<V> >
+template<typename Key, typename Value, typename H = std::hash<Key>, typename KE = std::equal_to<Key>, typename VE = std::equal_to<Value> >
 struct non_blocking_unordered_map : boost::noncopyable, smr::smr_destructible {
-	typedef K key_type;
-	typedef V mapped_type;
+	typedef Key key_type;
+	typedef Value value_type;
 	typedef H hash_type;
 	typedef KE key_equal;
 	typedef VE value_equal;
-	typedef non_blocking_unordered_map<key_type, mapped_type, hash_type, key_equal, value_equal> map_type;
-	typedef boost::optional<mapped_type> result_type;
+	typedef non_blocking_unordered_map<key_type, value_type, hash_type, key_equal, value_equal> map_type;
+	typedef boost::optional<value_type> result_type;
 
 	typedef array<void*> kv_array_type;
 	typedef array<size_t> hash_array_type;
 	typedef concurrent_auto_table<size_t> counter_t;
 
-	non_blocking_unordered_map(size_t initial_size = MIN_SIZE) : _reprobes(new (smr::smr) counter_t()) {
-		initial_size = std::min(initial_size, 1024U * 1024U);
+	non_blocking_unordered_map(size_t initial_size = MIN_SIZE) : _reprobes(new (smr::smr) counter_t()), _size(new (smr::smr) counter_t()) {
+		initial_size = std::min(initial_size, static_cast<size_t>(1024U * 1024U));
 		size_t i = MIN_SIZE_LOG;
-		for(; (1U << i) < (initial_size << 2U); ++i) {
+		for(; (static_cast<size_t>(1U) << i) < (initial_size << static_cast<size_t>(2U)); ++i) {
 		}
 		_kvs = new (smr::smr) kv_array_type(((1 << i) << 1) + 2);
-		_kvs->values[0] = new (smr::smr) CHM(new (smr::smr) counter_t());
+		_kvs->values[0] = new (smr::smr) CHM();
 		_kvs->values[1] = new (smr::smr) hash_array_type(1 << i);
 		_last_resize_milli = std::clock();
 	}
 
 	size_t size() const {
-		smr::stable_pointer<kv_array_type> kvs(&const_cast<kv_array_type*>(_kvs));
-		return static_cast<size_t>(chm(kvs)->size());
+		return _size->get();
 	}
 
 	bool is_empty() const {
@@ -95,85 +94,68 @@ struct non_blocking_unordered_map : boost::noncopyable, smr::smr_destructible {
 		return get(key) != nullptr;
 	}
 
-	result_type put(const key_type& key, const mapped_type& val) {
+	result_type put(const key_type& key, const value_type& val) {
 		key_type* k = new (smr::smr) key_type(key);
-		mapped_type* m = new (smr::smr) mapped_type(val);
-		smr::stable_pointer<mapped_type> r = putIfMatch(k, m, NO_MATCH_OLD());
-		if(r.get_pointer() == nullptr) {
-			// map has taken ownership of k and m
-			return result_type();
-		} else {
-			// map now taken ownership of k and m, relinquished ownership of r
-			result_type res = *r;
-			smr::smr_destroy(r, &finalize_value, nullptr);
-			return res;
-		}
+		value_type* v = new (smr::smr) value_type(val);
+		smr::stable_pointer<value_type> r = putIfMatch(k, v, NO_MATCH_OLD());
+		return do_cleanup(r, k, v);
 	}
 
-	result_type putIfAbsent(const key_type& key, const mapped_type& val) {
+	result_type putIfAbsent(const key_type& key, const value_type& val) {
 		key_type* k = new (smr::smr) key_type(key);
-		mapped_type* m = new (smr::smr) mapped_type(val);
-		smr::stable_pointer<mapped_type> r = putIfMatch(k, m, TOMBSTONE());
-		if(r.get_pointer() == nullptr) {
-			// map has taken ownership of k, m
-			return result_type();
-		} else {
-			// map has taken ownership of k, ignored m
-			smr::smr_destroy(m, &finalize_value, nullptr);
-			return result_type(*r);
-		}
+		value_type* v = new (smr::smr) value_type(val);
+		smr::stable_pointer<value_type> r = putIfMatch(k, v, TOMBSTONE());
+		return do_cleanup(r, k, v);
 	}
 
 	result_type remove(const key_type& key) {
-		smr::stable_pointer<mapped_type> r = putIfMatch(&key, TOMBSTONE(), NO_MATCH_OLD());
-		if(r.get_pointer() == nullptr) {
-			return result_type();
-		} else {
-			// map has relinquished ownership of r
-			result_type res = *r;
-			smr::smr_destroy(r.get_pointer(), &finalize_value, nullptr);
-			return res;
-		}
+		key_type* k = new (smr::smr) key_type(key);
+		smr::stable_pointer<value_type> r = putIfMatch(k, TOMBSTONE(), NO_MATCH_OLD());
+		return do_cleanup(r, k, TOMBSTONE());
 	}
 
-	bool remove(const key_type& key, const mapped_type& val) {
-		smr::stable_pointer<mapped_type> r = putIfMatch(&key, TOMBSTONE(), const_cast<mapped_type*>(&val));
+	bool remove(const key_type& key, const value_type& val) {
+		smr::stable_pointer<value_type> r = putIfMatch(&key, TOMBSTONE(), &val);
+		bool clean_key = false, clean_value = false, clean_return = false;
+		r = untwiddle_bits(r, clean_key, clean_value, clean_return);
+
 		if(r == nullptr) {
 			return false;
 		} else {
-			// map has relinquished ownership of r
-			smr::smr_destroy(r, &finalize_value, nullptr);
+			if(clean_return) {
+				smr::smr_destroy(r, &finalize_value, nullptr);
+			}
 			return true;
 		}
 	}
 
-	result_type replace(const key_type& key, const mapped_type& val) {
+	result_type replace(const key_type& key, const value_type& val) {
 		key_type* k = new (smr::smr) key_type(key);
-		mapped_type* m = new (smr::smr) mapped_type(val);
-		smr::stable_pointer<mapped_type> r = putIfMatch(k, m, MATCH_ANY());
-		if(r == nullptr) {
-			// map has ignored ownership of m
-			smr::smr_destroy(m, &finalize_value, nullptr);
-			return result_type();
-		} else {
-			// map has taken ownership of m, relinquished ownership of r
-			result_type res = *r;
-			smr::smr_destroy(r, &finalize_value, nullptr);
-			return res;
-		}
+		value_type* v = new (smr::smr) value_type(val);
+		smr::stable_pointer<value_type> r = putIfMatch(k, v, MATCH_ANY());
+		return do_cleanup(r, k, v);
 	}
 
-	bool replace(const key_type& key, const mapped_type& oldValue, const mapped_type& newValue) {
+	bool replace(const key_type& key, const value_type& oldValue, const value_type& newValue) {
 		key_type* k = new (smr::smr) key_type(key);
-		mapped_type* m = new (smr::smr) mapped_type(newValue);
-		smr::stable_pointer<mapped_type> r = putIfMatch(k, m, const_cast<mapped_type*>(&oldValue));
+		value_type* v = new (smr::smr) value_type(newValue);
+		smr::stable_pointer<value_type> r = putIfMatch(k, v, &oldValue);
+		bool clean_key = false, clean_value = false, clean_return = false;
+		r = untwiddle_bits(r, clean_key, clean_value, clean_return);
+
+		if(clean_key) {
+			smr::smr_destroy(k, &finalize_key, nullptr);
+		}
+		if(clean_value) {
+			smr::smr_destroy(v, &finalize_value, nullptr);
+		}
+
 		if(r == nullptr) {
-			// map has ignored ownership of m
-			smr::smr_destroy(m, &finalize_value, nullptr);
 			return false;
 		} else {
-			// map has taken ownership of m, relinquished ownership of r
-			smr::smr_destroy(r, &finalize_value, nullptr);
+			if(clean_return) {
+				smr::smr_destroy(r, &finalize_value, nullptr);
+			}
 			return true;
 		}
 	}
@@ -191,7 +173,7 @@ struct non_blocking_unordered_map : boost::noncopyable, smr::smr_destructible {
 	result_type get(const key_type& key) {
 		size_t fullhash = map_type::hash(key);
 		smr::stable_pointer<kv_array_type> kvs(&_kvs);
-		smr::stable_pointer<mapped_type> V(get_impl(this, kvs, &key, fullhash));
+		smr::stable_pointer<value_type> V(get_impl(this, kvs, &key, fullhash));
 		if(V.get_pointer() == nullptr) {
 			return result_type();
 		} else {
@@ -199,9 +181,11 @@ struct non_blocking_unordered_map : boost::noncopyable, smr::smr_destructible {
 		}
 	}
 
-	static void finalize(void*, void* ptr) {
+	static bool finalize(void*, void* ptr) {
 		map_type* a = static_cast<map_type*>(ptr);
 		a->~map_type();
+		::operator delete(a, smr::smr);
+		return false;
 	}
 
 	virtual smr::smr_destructible::finalizer_function_t get_finalizer() const {
@@ -211,51 +195,56 @@ struct non_blocking_unordered_map : boost::noncopyable, smr::smr_destructible {
 protected:
 	~non_blocking_unordered_map() {
 		smr::smr_destroy(_kvs, &finalize_kvs, nullptr);
+		smr::smr_destroy(_size);
 		smr::smr_destroy(_reprobes);
 	}
 
 private:
-	smr::stable_pointer<mapped_type> putIfMatch(const key_type* const key, mapped_type* const newVal, mapped_type* const oldVal) {
+	smr::stable_pointer<value_type> putIfMatch(const key_type* const key, value_type* const newVal, const value_type* const oldVal) {
 		smr::stable_pointer<kv_array_type> kvs(&_kvs);
-		smr::stable_pointer<mapped_type> res = putIfMatch(this, kvs, key, newVal, oldVal);
-		return res == TOMBSTONE() ? smr::stable_pointer<mapped_type>() : res;
+		smr::stable_pointer<value_type> res = putIfMatch(this, kvs, key, newVal, oldVal);
+		return res;
 	}
 
-	static void finalize_key(void*, void* ptr) {
+	static bool finalize_key(void*, void* ptr) {
 		key_type* k = static_cast<key_type*>(ptr);
 		k->~key_type();
+		::operator delete(k, smr::smr);
+		return false;
 	}
 
-	static void finalize_value(void*, void* ptr) {
-		mapped_type* m = static_cast<mapped_type*>(ptr);
-		m->~mapped_type();
+	static bool finalize_value(void*, void* ptr) {
+		value_type* m = static_cast<value_type*>(ptr);
+		m->~value_type();
+		::operator delete(m, smr::smr);
+		return false;
 	}
 
-	static void finalize_kvs(void* ctxt, void* ptr) {
-		kv_array_type* k = static_cast<kv_array_type*>(ptr);
-		bool shallow_finalize = reinterpret_cast<bool>(ctxt);
-		smr::stable_pointer<kv_array_type> sk(&k);
-		if(!shallow_finalize) {
-			smr::smr_destroy(map_type::chm(sk));
-			smr::smr_destroy(map_type::hashes(sk));
-		}
-		size_t count = map_type::len(sk);
-		for(size_t i(0); i < count; ++i) {
-			smr::stable_pointer<mapped_type> m(map_type::val(sk, i));
-			bool value_deleted(m.get_pointer() == map_type::TOMBSTONE() || m.get_pointer() == map_type::TOMBPRIME());
-			if(!shallow_finalize) {
-				if(m.get_pointer() != nullptr && m.get_pointer() != map_type::TOMBSTONE() && m.get_pointer() != map_type::TOMBPRIME()) {
-					smr::smr_destroy(map_type::unprime(m.get_pointer()), &finalize_value, nullptr);
+	static bool finalize_kvs(void* ctxt, void* ptr) {
+		kv_array_type* arr = static_cast<kv_array_type*>(ptr);
+		bool shallow_finalize = reinterpret_cast<size_t>(ctxt) != 0;
+		smr::stable_pointer<kv_array_type> sk(&arr);
+		if(!shallow_finalize)
+		{
+			size_t count = map_type::len(sk);
+			for(size_t i(0); i < count; ++i)
+			{
+				smr::stable_pointer<value_type>     v(map_type::val(sk, i));
+				smr::stable_pointer<const key_type> k(map_type::key(sk, i));
+				if(v.get_pointer() != nullptr && v.get_pointer() != map_type::TOMBSTONE() && v.get_pointer() != map_type::TOMBPRIME())
+				{
+					smr::smr_destroy(map_type::unprime(v.get_pointer()), &finalize_value, nullptr);
 				}
-			}
-			if(!shallow_finalize || value_deleted) {
-				smr::stable_pointer<const key_type> key(map_type::key(sk, i));
-				if(key.get_pointer() != nullptr && key.get_pointer() != TOMBSTONEK()) {
-					smr::smr_destroy(const_cast<key_type*>(key.get_pointer()), &finalize_key, nullptr);
+				if(k.get_pointer() != nullptr && k.get_pointer() != TOMBSTONEK())
+				{
+					smr::smr_destroy(const_cast<key_type*>(k.get_pointer()), &finalize_key, nullptr);
 				}
 			}
 		}
-		kv_array_type::finalize(nullptr, k);
+		smr::smr_destroy(hashes(sk));
+		smr::smr_destroy(chm(sk));
+		kv_array_type::finalize(nullptr, arr);
+		return false;
 	}
 
 	static bool keyeq(const key_type* const K, const key_type* const key, hash_array_type* const hashes, const size_t hash, const size_t fullhash) {
@@ -266,7 +255,7 @@ private:
 		        ke(*key, *K));
 	}
 
-	smr::stable_pointer<mapped_type> get_impl(map_type* const topmap, const smr::stable_pointer<kv_array_type>& kvs, const key_type* const key, const size_t fullhash) {
+	smr::stable_pointer<value_type> get_impl(map_type* const topmap, const smr::stable_pointer<kv_array_type> kvs, const key_type* const key, const size_t fullhash) {
 		const size_t           len    = map_type::len(kvs);
 		CHM*             const chm    = map_type::chm(kvs);
 		hash_array_type* const hashes = map_type::hashes(kvs);
@@ -275,27 +264,77 @@ private:
 		size_t reprobe_cnt = 0;
 		for(;;) {
 			smr::stable_pointer<const key_type   > K = map_type::key(kvs, idx);
-			smr::stable_pointer<      mapped_type> V = map_type::val(kvs, idx);
+			smr::stable_pointer<      value_type> V = map_type::val(kvs, idx);
 			if(K == nullptr) {
-				return smr::stable_pointer<mapped_type>();
+				return smr::stable_pointer<value_type>();
 			}
 
 			smr::stable_pointer<kv_array_type> newkvs(&chm->_newkvs);
 			if(map_type::keyeq(map_type::unprime(K.get_pointer()), key, hashes, idx, fullhash)) {
 				if(!map_type::is_prime(V.get_pointer())) {
-					return V == map_type::TOMBSTONE() ? smr::stable_pointer<mapped_type>() : V;
+					return V == map_type::TOMBSTONE() ? smr::stable_pointer<value_type>() : V;
 				}
 				return get_impl(topmap, chm->copy_slot_and_check(topmap, kvs, idx, key), key, fullhash);
 			}
 
-			if(++reprobe_cnt >= reprobe_limit(len) || key == map_type::TOMBSTONEK()) {
-				return newkvs == nullptr ? smr::stable_pointer<mapped_type>() : get_impl(topmap, topmap->help_copy(newkvs), key, fullhash);
+			if(++reprobe_cnt >= reprobe_limit(len) || K == map_type::TOMBSTONEK()) {
+				return newkvs == nullptr ? smr::stable_pointer<value_type>() : get_impl(topmap, topmap->help_copy(newkvs), key, fullhash);
 			}
 			idx = (idx + 1) & (len - 1);
 		}
 	}
 
-	static smr::stable_pointer<mapped_type> putIfMatch(map_type* const topmap, smr::stable_pointer<kv_array_type> kvs, const key_type* const key, mapped_type* const putval, mapped_type* const expVal) {
+	static smr::stable_pointer<value_type> twiddle_bits(smr::stable_pointer<value_type> ptr, bool clean_key, bool clean_value, bool clean_return) {
+		size_t raw = reinterpret_cast<size_t>(ptr.get_pointer());
+		raw &= ~0x7;
+		if(raw == reinterpret_cast<size_t>(TOMBSTONE())) {
+			raw = 0;
+		}
+		if(clean_key) {
+			raw |= 0x1;
+		}
+		if(clean_value) {
+			raw |= 0x2;
+		}
+		if(clean_return) {
+			raw |= 0x4;
+		}
+		ptr.get_pointer() = reinterpret_cast<smr::stable_pointer<value_type>::pointer_type>(raw);
+		return ptr;
+	}
+
+	static smr::stable_pointer<value_type> untwiddle_bits(smr::stable_pointer<value_type> ptr, bool& clean_key, bool& clean_value, bool& clean_return) {
+		size_t raw = reinterpret_cast<size_t>(ptr.get_pointer());
+		clean_key    = (raw & 0x1) != 0;
+		clean_value  = (raw & 0x2) != 0;
+		clean_return = (raw & 0x4) != 0;
+		raw &= ~0x7;
+		ptr.get_pointer() = reinterpret_cast<smr::stable_pointer<value_type>::pointer_type>(raw);
+		return ptr;
+	}
+
+	static result_type do_cleanup(smr::stable_pointer<value_type> r, key_type* k, value_type* v) {
+		bool clean_key = false, clean_value = false, clean_return = false;
+		r = untwiddle_bits(r, clean_key, clean_value, clean_return);
+		if(clean_key) {
+			smr::smr_destroy(k, &finalize_key, nullptr);
+		}
+		if(clean_value) {
+			smr::smr_destroy(v, &finalize_value, nullptr);
+		}
+	
+		if(r.get_pointer() == nullptr) {
+			return result_type();
+		} else {
+			result_type res = *r;
+			if(clean_return) {
+				smr::smr_destroy(r, &finalize_value, nullptr);
+			}
+			return res;
+		}
+	}
+
+	static smr::stable_pointer<value_type> putIfMatch(map_type* const topmap, smr::stable_pointer<kv_array_type> kvs, const key_type* const key, value_type* putval, const value_type* const expVal) {
 		const size_t           fullhash = map_type::hash(*key);
 		const size_t           len      = map_type::len(kvs);
 		CHM*             const chm      = map_type::chm(kvs);
@@ -303,51 +342,95 @@ private:
 
 		size_t idx = fullhash & (len - 1);
 
+		bool clean_key    = true;
+		bool clean_value  = true;
+		bool clean_return = true;
+
 		size_t reprobe_cnt = 0;
-		bool key_match = false;
 		smr::stable_pointer<const key_type> K;
-		smr::stable_pointer<mapped_type>    V;
+		smr::stable_pointer<value_type>    V;
 		smr::stable_pointer<kv_array_type> newkvs;
 		for(;;) {
-			V = map_type::val(kvs, idx);
-			K = map_type::key(kvs, idx);
-			if(K == nullptr) {
+			V = map_type::val(kvs, idx); // Get old value (before volatile read below!)
+			K = map_type::key(kvs, idx); // Get current key
+			if(K == nullptr) { // Slot is free?
+				// Found an empty Key slot - which means this Key has never been in
+				// this table.  No need to put a Tombstone - the Key is not here!
 				if(putval == map_type::TOMBSTONE()) {
-					return smr::make_unshared_stable_pointer(putval);
+					clean_value  = false; // both the input value
+					clean_return = false; // and the return value are tombstones and do not need cleaning
+					return twiddle_bits(smr::make_unshared_stable_pointer(putval), clean_key, clean_value, clean_return); // Not-now & never-been in this table
 				}
-				if(CAS_key(kvs, idx, nullptr, key)) {
-					chm->_slots->increment();
-					hashes->values[idx] = fullhash;
-					break;
+				// Claim the null key-slot
+				if(CAS_key(kvs, idx, nullptr, key)) { // Claim slot for Key
+					chm->_slots->increment();        // Raise key-slots-used count
+					hashes->values[idx] = fullhash;  // Memoize fullhash
+					clean_key = false;               // ownership of the key has been transferred into the map
+					break;                           // Got it!
 				}
+				// CAS to claim the key-slot failed
 				K = map_type::key(kvs, idx);
 			}
-			newkvs = &chm->_newkvs;
+		
+			// Key slot was not null, there exists a Key here
+
+			// We need a volatile-read here to preserve happens-before semantics on
+			// newly inserted Keys.  If the Key body was written just before inserting
+			// into the table a Key-compare here might read the uninitalized Key body.
+			// Annoyingly this means we have to volatile-read before EACH key compare.
+			newkvs = &chm->_newkvs; // VOLATILE READ before key compare
 			if(keyeq(map_type::unprime(K.get_pointer()), key, hashes, idx, fullhash)) {
-				key_match = true;
-				break;
+				break; // Got it!
 			}
 
-			if(++reprobe_cnt >= reprobe_limit(len) ||
-			   key == TOMBSTONEK()) {
+			// get and put must have the same key lookup logic!  Lest 'get' give
+			// up looking too soon.
+			if(++reprobe_cnt >= reprobe_limit(len) || // too many probes or
+			   K == TOMBSTONEK()) { // found a TOMBSTONE key, means no more keys
+				// We simply must have a new table to do a 'put'.  At this point a
+				// 'get' will also go to the new table (if any).  We do not need
+				// to claim a key slot (indeed, we cannot find a free one to claim!).
 				newkvs = chm->resize(topmap, kvs);
 				if(expVal != nullptr) {
-					topmap->help_copy(newkvs);
+					topmap->help_copy(newkvs); // help along an existing copy
 				}
 				return putIfMatch(topmap, newkvs, key, putval, expVal);
 			}
-			idx = (idx + 1) & (len - 1);
-		}
+			idx = (idx + 1) & (len - 1); // Reprobe!
+		} // End of spinning till we get a Key slot
 
+		// Found the proper Key slot, now update the matching Value slot.  We
+		// never put a null, so Value slots monotonically move from null to
+		// not-null (deleted Values use Tombstone).  Thus if 'V' is null we
+		// fail this fast cutout and fall into the check for table-full.
 		if(V == putval) {
-			return V;
+			if(putval == TOMBSTONE() || putval == TOMBPRIME()) {
+				clean_value = false; // fake values don't need cleaning
+			}
+			clean_return = false; // in any case, we're not giving up ownership
+			return twiddle_bits(V, clean_key, clean_value, clean_return); // Fast cutout for no-change
 		}
-
-		if(newkvs == nullptr &&
+	
+		// See if we want to move to a new table (to avoid high average re-probe
+		// counts).  We only check on the initial set of a Value from null to
+		// not-null (i.e., once per key-insert).  Of course we got a 'free' check
+		// of newkvs once per key-compare (not really free, but paid-for by the
+		// time we get here).
+		if(newkvs == nullptr && // New table-copy already spotted?
+		  // Once per fresh key-insert check the hard way
 		  ((V == nullptr && chm->tableFull(reprobe_cnt, len)) ||
+		  // Or we found a Prime, but the JMM allowed reordering such that we
+		  // did not spot the new table (very rare race here: the writing
+		  // thread did a CAS of _newkvs then a store of a Prime.  This thread
+		  // reads the Prime, then reads _newkvs - but the read of Prime was so
+		  // delayed (or the read of _newkvs was so accelerated) that they
+		  // swapped and we still read a null _newkvs.  The resize call below
+		  // will do a CAS on _newkvs forcing the read.
 		  map_type::is_prime(V.get_pointer()))) {
-			newkvs = chm->resize(topmap, kvs);
+			newkvs = chm->resize(topmap, kvs); // Force the new table copy to start
 		}
+		// See if we are moving to a new table.
+		// If so, copy our slot and retry in the new table.
 		if(newkvs != nullptr) {
 			return putIfMatch(topmap, chm->copy_slot_and_check(topmap, kvs, idx, expVal), key, putval, expVal);
 		}
@@ -363,28 +446,36 @@ private:
 		//	}
 		//}
 
+		// We are finally prepared to update the existing table
 		for(;;) {
 			value_equal veq;
+			// Must match old, and we do not?  Then bail out now.  Note that either V
+			// or expVal might be TOMBSTONE.  Also V can be null, if we've never
+			// inserted a value before.  expVal can be null if we are called from
+			// copy_slot.
 			if(expVal != map_type::NO_MATCH_OLD() &&
 			   V != expVal &&
 			   (expVal != map_type::MATCH_ANY() || V == map_type::TOMBSTONE() || V == nullptr) &&
 			   !(V == nullptr && expVal == map_type::TOMBSTONE()) &&
 			   (expVal == nullptr || expVal == map_type::TOMBSTONE() || !veq(*expVal, *V))) {
-				return V;
+				clean_return = false; // not giving up ownership
+				return twiddle_bits(V, clean_key, clean_value, clean_return);
 			}
 
 			if(CAS_val(kvs, idx, V.get_pointer(), putval)) {
+				clean_value = false; // ownership of the new value has been transferred into the map
 				if(expVal != nullptr) {
 					if( (V == nullptr || V == map_type::TOMBSTONE()) && putval != map_type::TOMBSTONE()) {
-						chm->_size->increment();
+						topmap->_size->increment();
 					}
 					if(!(V == nullptr || V == map_type::TOMBSTONE()) && putval == map_type::TOMBSTONE()) {
-						chm->_size->decrement();
-						// queue finalization, but it'll be kept alive until after the value is copied out
-						smr::smr_destroy(V, &map_type::finalize_value, nullptr);
+						topmap->_size->decrement();
 					}
 				}
-				return (V == nullptr && expVal != nullptr) ? smr::make_unshared_stable_pointer(map_type::TOMBSTONE()) : V;
+				if(V == nullptr || V == map_type::TOMBSTONE()) {
+					clean_return = false; // fake values don't need cleaning
+				}
+				return twiddle_bits((V == nullptr && expVal != nullptr) ? smr::make_unshared_stable_pointer(map_type::TOMBSTONE()) : V, clean_key, clean_value, clean_return);
 			}
 			V = val(kvs, idx);
 			if(map_type::is_prime(V.get_pointer())) {
@@ -393,7 +484,7 @@ private:
 		}
 	}
 
-	smr::stable_pointer<kv_array_type>& help_copy(smr::stable_pointer<kv_array_type>& helper) {
+	smr::stable_pointer<kv_array_type> help_copy(smr::stable_pointer<kv_array_type> helper) {
 		smr::stable_pointer<kv_array_type> topkvs(&_kvs);
 		CHM* topchm = map_type::chm(topkvs);
 		if(topchm->_newkvs == nullptr) {
@@ -408,21 +499,18 @@ private:
 	struct CHM : boost::noncopyable, smr::smr_destructible {
 		friend struct map_type;
 
-		// Size in active K,V pairs
-		size_t size() const {
-			return _size->get();
-		}
-
 		size_t slots() const {
 			return _slots->get();
 		}
 
-		CHM(counter_t* size) : _size(size), _slots(new (smr::smr) counter_t()), _newkvs(nullptr), _resizers(0), _copyIdx(0), _copyDone(0) {
+		CHM() : _slots(new (smr::smr) counter_t()), _newkvs(nullptr), _resizers(0), _copyIdx(0), _copyDone(0) {
 		}
-
-		static void finalize(void*, void* ptr) {
+	
+		static bool finalize(void*, void* ptr) {
 			CHM* c = static_cast<CHM*>(ptr);
 			c->~CHM();
+			::operator delete(c, smr::smr);
+			return false;
 		}
 
 		virtual smr::smr_destructible::finalizer_function_t get_finalizer() const {
@@ -431,13 +519,10 @@ private:
 
 	protected:
 		~CHM() {
-			smr::smr_destroy(_size);
 			smr::smr_destroy(_slots);
 		}
 
 	private:
-		counter_t* const _size;
-
 		// These next 2 fields are used in the resizing heuristics, to judge when
 		// it is time to resize or copy the table. Slots is a count of used-up
 		// key slots, and when it nears a large fraction of the table we probably
@@ -457,7 +542,7 @@ private:
 		// null to set (once).
 		kv_array_type* volatile _newkvs;
 		// Set the _next field if we can.
-		bool CAS_newkvs(smr::stable_pointer<kv_array_type>& newkvs) {
+		bool CAS_newkvs(smr::stable_pointer<kv_array_type> newkvs) {
 			while(_newkvs == nullptr) {
 				if(smr::util::cas(&_newkvs, static_cast<kv_array_type*>(nullptr), newkvs.get_pointer())) {
 					return true;
@@ -501,7 +586,7 @@ private:
 		// Since this routine has a fast cutout for copy-already-started, callers
 		// MUST 'help_copy' lest we have a path which forever runs through
 		// 'resize' only to discover a copy-in-progress which never progresses.
-		smr::stable_pointer<kv_array_type> resize(map_type* topmap, smr::stable_pointer<kv_array_type>& kvs) {
+		smr::stable_pointer<kv_array_type> resize(map_type* topmap, smr::stable_pointer<kv_array_type> kvs) {
 			// Check for resize already in progress, probably triggered by another thread
 			smr::stable_pointer<kv_array_type> newkvs(&_newkvs);
 			if(newkvs.get_pointer() != nullptr) {
@@ -510,7 +595,7 @@ private:
 
 			// No copy in-progress, so start one. First up: compute new table size.
 			size_t oldlen = map_type::len(kvs); // Old count of K,V pairs allowed
-			size_t sz = size(); // Get current table count of active K,V pairs
+			size_t sz = topmap->size(); // Get current table count of active K,V pairs
 			size_t newsz = sz; // First size estimate
 
 			// Heuristic to determine new size. We expect plenty of dead-slots-with-keys
@@ -539,7 +624,7 @@ private:
 
 			// Convert to power-of-2
 			size_t log2 = MIN_SIZE_LOG;
-			for(; (1U << log2) < newsz; ++log2) { // Compute log2 of size
+			for(; (static_cast<size_t>(1U) << log2) < newsz; ++log2) { // Compute log2 of size
 			}
 
 			// Now limit the number of threads actually allocating memory to a
@@ -571,7 +656,7 @@ private:
 
 			// Double size for K,V pairs, add 1 for CHM
 			newkvs.unshared_assign(new (smr::smr) kv_array_type(((1 << log2) << 1) + 2)); // This can get expensive for big arrays
-			newkvs->values[0] = new (smr::smr) CHM(_size); // CHM in slot 0
+			newkvs->values[0] = new (smr::smr) CHM(); // CHM in slot 0
 			newkvs->values[1] = new (smr::smr) hash_array_type(1 << log2); // hashes in slot 1
 
 			if(_newkvs != nullptr) {
@@ -603,10 +688,10 @@ private:
 		// Help along an existing resize operation. We hope its the top-level
 		// copy (it was when we started) but this CHM might have been promoted out
 		// of the top position.
-		void help_copy_impl(map_type* topmap, smr::stable_pointer<kv_array_type>& oldkvs, bool copy_all) {
+		void help_copy_impl(map_type* topmap, smr::stable_pointer<kv_array_type> oldkvs, bool copy_all) {
 			smr::stable_pointer<kv_array_type> newkvs(&_newkvs);
 			size_t oldlen = map_type::len(oldkvs); // Total amount to copy
-			const size_t MIN_COPY_WORK = std::min(oldlen, 1024U); // Limit per-thread work
+			const size_t MIN_COPY_WORK = std::min(oldlen, static_cast<size_t>(1024U)); // Limit per-thread work
 
 			size_t panic_start = ~0U;
 			size_t copyidx = ~0U;
@@ -666,7 +751,7 @@ private:
 		// before any Prime appears. So the caller needs to read the _newkvs
 		// field to retry his operation in the new table, but probably has not
 		// read it yet.
-		smr::stable_pointer<kv_array_type> copy_slot_and_check(map_type* topmap, const smr::stable_pointer<kv_array_type>& oldkvs, size_t idx, const key_type* const should_help) {
+		smr::stable_pointer<kv_array_type> copy_slot_and_check(map_type* topmap, const smr::stable_pointer<kv_array_type> oldkvs, size_t idx, const key_type* const should_help) {
 			smr::stable_pointer<kv_array_type> newkvs(&_newkvs);
 			// We're only here because the caller saw a Prime, which implies a
 			// table-copy is in progress.
@@ -677,7 +762,7 @@ private:
 			return (should_help == nullptr) ? newkvs : topmap->help_copy(newkvs);
 		}
 	
-		void copy_check_and_promote(map_type* topmap, const smr::stable_pointer<kv_array_type>& oldkvs, size_t workdone) {
+		void copy_check_and_promote(map_type* topmap, const smr::stable_pointer<kv_array_type> oldkvs, size_t workdone) {
 			size_t oldlen = len(oldkvs);
 			// We made a slot unusable and so did some of the needed copy work
 			size_t copyDone = _copyDone;
@@ -710,7 +795,7 @@ private:
 		// not-null must have been from a copy_slot (or other old-table overwrite)
 		// and not from a thread directly writing in the new table. Thus we can
 		// count null-to-not-null transitions in the new table.
-		bool copy_slot(map_type* topmap, size_t idx, const smr::stable_pointer<kv_array_type>& oldkvs, smr::stable_pointer<kv_array_type>& newkvs) {
+		bool copy_slot(map_type* topmap, size_t idx, const smr::stable_pointer<kv_array_type> oldkvs, smr::stable_pointer<kv_array_type> newkvs) {
 			// Blindly set the key slot from null to TOMBSTONE, to eagerly stop
 			// fresh put's from inserting new values in the old table when the old
 			// table is mid-resize. We don't need to act on the results here,
@@ -723,10 +808,10 @@ private:
 			
 			// Prevent new values from appearing in the old table.
 			// Box what we see in the old table, to prevent further updates.
-			smr::stable_pointer<mapped_type> oldval = map_type::val(oldkvs, idx); // Read OLD table
+			smr::stable_pointer<value_type> oldval = map_type::val(oldkvs, idx); // Read OLD table
 			while(!map_type::is_prime(oldval.get_pointer())) {
-				smr::stable_pointer<mapped_type> box = (oldval == nullptr || oldval == map_type::TOMBSTONE()) ? smr::make_unshared_stable_pointer(map_type::TOMBPRIME())
-				                                                                                              : smr::make_unshared_stable_pointer(map_type::prime(oldval.get_pointer()));
+				smr::stable_pointer<value_type> box = (oldval == nullptr || oldval == map_type::TOMBSTONE()) ? smr::make_unshared_stable_pointer(map_type::TOMBPRIME())
+				                                                                                             : smr::make_unshared_stable_pointer(map_type::prime(oldval.get_pointer()));
 				if(CAS_val(oldkvs, idx, oldval.get_pointer(), box.get_pointer()) ) { // CAS down a box'd version of oldval
 					// If we made the Value slot hold a TOMBPRIME, then we both
 					// prevented further updates here but also the (absent)
@@ -755,7 +840,7 @@ private:
 			// appears in the old table. If putIfMatch does not find a null in the
 			// new table - somebody else should have recorded the null-not_null
 			// transition in this copy.
-			smr::stable_pointer<mapped_type> old_unboxed = smr::make_unshared_stable_pointer(map_type::unprime(oldval.get_pointer()));
+			smr::stable_pointer<value_type> old_unboxed = smr::make_unshared_stable_pointer(map_type::unprime(oldval.get_pointer()));
 			bool copied_into_new = (map_type::putIfMatch(topmap, newkvs, key.get_pointer(), old_unboxed.get_pointer(), nullptr) == nullptr);
 			
 			// ---
@@ -811,13 +896,15 @@ private:
 	// than 'put'. 'get' can skip the extra indirection of skipping through the
 	// CHM to reach the _kvs array.
 	kv_array_type* _kvs;
-	static CHM*             chm   (const smr::stable_pointer<kv_array_type>& kvs) { return static_cast<CHM*            >(kvs->values[0]); }
-	static hash_array_type* hashes(const smr::stable_pointer<kv_array_type>& kvs) { return static_cast<hash_array_type*>(kvs->values[1]); }
+	static __forceinline CHM*             chm   (const smr::stable_pointer<kv_array_type>& kvs) { return static_cast<CHM*            >(kvs->values[0]); }
+	static __forceinline hash_array_type* hashes(const smr::stable_pointer<kv_array_type>& kvs) { return static_cast<hash_array_type*>(kvs->values[1]); }
 	// Number of K,V pairs in the table
-	static size_t           len   (const smr::stable_pointer<kv_array_type>& kvs) { return (kvs->length - 2) >> 1; }
+	static __forceinline size_t           len   (const smr::stable_pointer<kv_array_type>& kvs) { return (kvs->length - 2) >> 1; }
 	bool CAS_kvs(const smr::stable_pointer<kv_array_type>& oldkvs, const smr::stable_pointer<kv_array_type>& newkvs) {
 		return smr::util::cas(&_kvs, oldkvs.get_pointer(), newkvs.get_pointer());
 	}
+
+	counter_t* const _size;
 
 	static const size_t REPROBE_LIMIT = 10; // Too many reprobes then force a table-resize
 
@@ -829,19 +916,19 @@ private:
 
 	// No-Match-Old - putIfMatch does updates only if it matches the old value,
 	// and NO_MATCH_OLD basically counts as a wildcard match.
-	static mapped_type* NO_MATCH_OLD() { return reinterpret_cast<mapped_type*>(0x2); }
+	static value_type* NO_MATCH_OLD() { return reinterpret_cast<value_type*>(0x2); }
 	// Match-Any-not-null - putIfMatch does updates only if it find a real old
 	// value.
-	static mapped_type* MATCH_ANY   () { return reinterpret_cast<mapped_type*>(0x4); }
+	static value_type* MATCH_ANY   () { return reinterpret_cast<value_type*>(0x4); }
 	// This K/V pair has been deleted (but the Key slot is forever claimed).
 	// The same Key can be reinserted with a new value later.
-	static mapped_type* TOMBSTONE   () { return reinterpret_cast<mapped_type*>(0x8); }
-	static key_type   * TOMBSTONEK  () { return reinterpret_cast<key_type   *>(0x8); }
+	static value_type* TOMBSTONE   () { return reinterpret_cast<value_type*>(0x8); }
+	static key_type  * TOMBSTONEK  () { return reinterpret_cast<key_type  *>(0x8); }
 	// Prime'd or box'd version of TOMBSTONE. This K/V pair was deleted, then a
 	// table resize started. The K/V pair has been marked so that no new
 	// updates can happen to the old table (and since the K/V pair was deleted
 	// nothing was copied to the new table).
-	static mapped_type* TOMBPRIME   () { return prime(TOMBSTONE()); }
+	static value_type* TOMBPRIME   () { return prime(TOMBSTONE()); }
 
 	// Access K,V for a given idx
 	//
@@ -852,14 +939,14 @@ private:
 	static smr::stable_pointer<const key_type   > key(const smr::stable_pointer<kv_array_type>& kvs, size_t idx) {
 		return smr::stable_pointer<const key_type   >(const_cast<const key_type**>(reinterpret_cast<key_type   **>(&kvs->values[(idx << 1) + 2])));
 	}
-	static smr::stable_pointer<      mapped_type> val(const smr::stable_pointer<kv_array_type>& kvs, size_t idx) {
-		return smr::stable_pointer<      mapped_type>(                             reinterpret_cast<mapped_type**>(&kvs->values[(idx << 1) + 3]) );
+	static smr::stable_pointer<      value_type> val(const smr::stable_pointer<kv_array_type>& kvs, size_t idx) {
+		return smr::stable_pointer<      value_type>(                             reinterpret_cast<value_type**>(&kvs->values[(idx << 1) + 3]) );
 	}
 	static bool CAS_key(const smr::stable_pointer<kv_array_type>& kvs, size_t idx, const key_type* old, const key_type* key) {
 		return smr::util::cas(reinterpret_cast<key_type**>(&kvs->values[(idx << 1) + 2]), const_cast<key_type*>(old), const_cast<key_type*>(key));
 	}
-	static bool CAS_val(const smr::stable_pointer<kv_array_type>& kvs, size_t idx, mapped_type* old, mapped_type* val) {
-		return smr::util::cas(reinterpret_cast<mapped_type**>(&kvs->values[(idx << 1) + 3]), old, val);
+	static bool CAS_val(const smr::stable_pointer<kv_array_type>& kvs, size_t idx, value_type* old, value_type* val) {
+		return smr::util::cas(reinterpret_cast<value_type**>(&kvs->values[(idx << 1) + 3]), old, val);
 	}
 
 	counter_t* _reprobes;

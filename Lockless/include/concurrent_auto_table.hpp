@@ -18,9 +18,11 @@ struct array : smr::smr_destructible, boost::noncopyable {
 	array(size_t length_) : length(length_), values(new (smr::smr) element_type[length]) {
 	}
 
-	static void finalize(void*, void* ptr) {
+	static bool finalize(void*, void* ptr) {
 		array_type* a = static_cast<array_type*>(ptr);
 		a->~array_type();
+		::operator delete(a, smr::smr);
+		return false;
 	}
 
 	virtual smr::smr_destructible::finalizer_function_t get_finalizer() const {
@@ -31,12 +33,14 @@ struct array : smr::smr_destructible, boost::noncopyable {
 	element_type* const values;
 
 protected:
-	static void finalize_elements(void* ctxt, void* ptr) {
+	static bool finalize_elements(void* ctxt, void* ptr) {
 		element_type* elements = static_cast<element_type*>(ptr);
 		size_t length = reinterpret_cast<size_t>(ctxt);
 		for(size_t i(0); i < length; ++i) {
 			elements[i].~element_type();
 		}
+		::operator delete[](elements, smr::smr);
+		return false;
 	}
 
 	~array() {
@@ -63,17 +67,18 @@ struct concurrent_auto_table : smr::smr_destructible, boost::noncopyable {
 	typedef std::hash<integer_type> hash_type;
 	typedef array<integer_type> array_type;
 
-	concurrent_auto_table() {
-		_cat = new (smr::smr) CAT(nullptr, 4, integer_type());
+	concurrent_auto_table() : _cat(new (smr::smr) CAT(nullptr, 4, integer_type())){
 	}
 
 	virtual smr::smr_destructible::finalizer_function_t get_finalizer() const {
 		return &finalize;
 	}
 
-	static void finalize(void*, void* ptr) {
+	static bool finalize(void*, void* ptr) {
 		table_type* a = static_cast<table_type*>(ptr);
 		a->~table_type();
+		::operator delete(a, smr::smr);
+		return false;
 	}
 
 	// Add the given value to current counter value. Concurrent updates will
@@ -165,9 +170,11 @@ private:
 			return &finalize;
 		}
 
-		static void finalize(void*, void* ptr) {
+		static bool finalize(void*, void* ptr) {
 			CAT* c = static_cast<CAT*>(ptr);
 			c->~CAT();
+			::operator delete(c, smr::smr);
+			return false;
 		}
 
 		// Only add 'x' to some slot in table, hinted at by 'hash', if bits under
@@ -240,6 +247,7 @@ private:
 
 			CAT* newcat = new (smr::smr) CAT(this, t->length * 2, integer_type());
 			if(!master->CAS_cat(this, newcat)) {
+				newcat->_next = nullptr;
 				smr::smr_destroy(newcat);
 			}
 			return old;
@@ -385,7 +393,7 @@ private:
 			return smr::util::cas(&A[idx], old, nnn);
 		}
 
-		CAT* const _next;
+		CAT* _next;
 
 		mutable volatile integer_type _sum_cache;
 		mutable volatile integer_type _fuzzy_sum_cache;
@@ -394,7 +402,7 @@ private:
 
 		static const size_t MAX_SPIN = 2;
 
-		array_type* const _t; // Power-of-2 array of integer_types
+		array_type* const volatile _t; // Power-of-2 array of integer_types
 	};
 
 	hash_type hasher;

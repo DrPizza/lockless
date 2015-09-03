@@ -57,7 +57,7 @@ void delete_interlocked_kv_list(interlocked_kv_list_t* s) {
 		interlocked_kv_list_delete(s, h->key);
 	}
 	deallocate_hazard_pointers(key);
-	smr_free(s);
+	smr_retire(s);
 }
 
 void* mark_as_deleted(void* ptr) {
@@ -90,7 +90,7 @@ try_again:
 			if(!casp((void* volatile*)v->prev, v->current, mark_as_undeleted(v->next))) {
 				goto try_again;
 			}
-			smr_free(v->current);
+			smr_retire(v->current);
 			v->current = mark_as_undeleted(v->next);
 		} else {
 			void* volatile* tmp;
@@ -132,13 +132,14 @@ bool interlocked_kv_list_insert(interlocked_kv_list_t* s, const void* key, void*
 	return insert(&s->head, node, s->cmp, &v);
 }
 
-void finalize_node(void* context, void* ptr) {
+bool finalize_node(void* context, void* ptr) {
 	interlocked_kv_list_node_t* node = ptr;
 	interlocked_kv_list_node_destructors_t* d = context;
 
 	d->key_destructor(node->key);
 	d->value_destructor(node->value);
-	smr_free(d);
+	smr_retire(d);
+	return true;
 }
 
 bool del(interlocked_kv_list_node_t** head, const void* key, key_cmp cmp, interlocked_kv_list_node_destructors_t* destructors, per_thread_vars_t* v) {
@@ -153,7 +154,7 @@ bool del(interlocked_kv_list_node_t** head, const void* key, key_cmp cmp, interl
 			interlocked_kv_list_node_destructors_t* destructor_copy = smr_alloc(sizeof(interlocked_kv_list_node_destructors_t));
 			destructor_copy->key_destructor = destructors->key_destructor;
 			destructor_copy->value_destructor = destructors->value_destructor;
-			smr_free_with_finalizer(v->current, &finalize_node, destructor_copy);
+			smr_retire_with_finalizer(v->current, &finalize_node, destructor_copy);
 		} else {
 			find(head, key, cmp, v);
 		}

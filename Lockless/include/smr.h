@@ -20,11 +20,15 @@ typedef char bool;
 #define CACHE_LINE 64
 #define CACHE_ALIGN __declspec(align(CACHE_LINE))
 
-typedef void (*finalizer_function_t)(void* finalizer_context, void* node_data);
+// return true if the memory should be freed with smr_free after the finalizer is called
+typedef bool (*finalizer_function_t)(void* finalizer_context, void* node_data);
 
 void* smr_alloc(size_t size);
+void smr_retire(void* ptr);
+void smr_retire_with_finalizer(void* ptr, finalizer_function_t finalizer, void* finalizer_context);
 void smr_free(void* ptr);
-void smr_free_with_finalizer(void* ptr, finalizer_function_t finalizer, void* finalizer_context);
+void smr_clean();
+
 void* allocate_hazard_pointers(LONG count, void* volatile** pointers);
 void deallocate_hazard_pointers(void* key);
 

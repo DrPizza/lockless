@@ -36,7 +36,7 @@ void delete_interlocked_stack(interlocked_stack_t* s)
 	{
 		s->value_destructor(value);
 	}
-	smr_free(s);
+	smr_retire(s);
 }
 
 void interlocked_stack_push(interlocked_stack_t* s, void* data)
@@ -90,7 +90,7 @@ bool interlocked_stack_pop(interlocked_stack_t* s, void** output)
 	t->next = nullptr; // make delinking detectable, otherwise this can be pointing off at no-man's land
 	MemoryBarrier();
 	deallocate_hazard_pointers(key);
-	smr_free(t);
+	smr_retire(t);
 	if(output) { *output = data; }
 	return true;
 }

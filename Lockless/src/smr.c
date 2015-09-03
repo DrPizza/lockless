@@ -2,12 +2,16 @@
 
 #include "smr.h"
 
+#pragma warning(disable : 4200) // warning C4200: nonstandard extension used : zero-sized array in struct/union
 #pragma warning(disable : 4204) // warning C4204: nonstandard extension used : non-constant aggregate initializer
 #pragma warning(disable : 4324) // warning C4234: structure was padded due to __declspec(align())
 #define CACHE_LINE 64
 #define CACHE_ALIGN __declspec(align(CACHE_LINE))
 
 static DWORD thr_slot = TLS_OUT_OF_INDEXES;
+
+static CACHE_ALIGN volatile LONG total_hazard_pointers = 0;
+static CACHE_ALIGN volatile LONG total_thread_records = 0;
 
 typedef struct retired_data
 {
@@ -18,61 +22,62 @@ typedef struct retired_data
 
 void dispose_retired_data(retired_data_t node)
 {
+	bool needs_free = true;
 	if(node.finalizer != nullptr)
 	{
-		node.finalizer(node.finalizer_context, node.node);
+		needs_free = node.finalizer(node.finalizer_context, node.node);
 	}
-	_aligned_free(node.node);
+	if(needs_free)
+	{
+		_aligned_free(node.node);
+	}
 }
-
-typedef struct retired_list_node
-{
-	SLIST_ENTRY list_entry;
-	retired_data_t retired_data;
-} retired_list_node_t;
 
 typedef struct retired_list
 {
-	SLIST_HEADER* list;
+#ifdef _DEBUG
+	char type[16];
+#endif
+	LONG retired_count;
+	LONG maximum_size;
+	retired_data_t retired_list[0];
 } retired_list_t;
 
 retired_list_t* new_retired_list()
 {
-	retired_list_t* rl = smr_alloc(sizeof(retired_list_t));
-	memset(rl, 0, sizeof(retired_list_t));
-	rl->list = smr_alloc(sizeof(SLIST_HEADER));
-	InitializeSListHead(rl->list);
+	LONG size = total_hazard_pointers;
+	size = max(size, 1);
+	retired_list_t* rl = smr_alloc(sizeof(retired_list_t) + (size * sizeof(retired_data_t)));
+	memset(rl, 0, sizeof(retired_list_t) + (size * sizeof(retired_data_t)));
+	rl->maximum_size = size;
+#ifdef _DEBUG
+	strcat(rl->type, "retired_list");
+#endif
 	return rl;
 }
 
 void delete_retired_list(retired_list_t* l)
 {
-	retired_list_node_t* h = nullptr;
-	for(h = (retired_list_node_t*)InterlockedFlushSList(l->list); h != nullptr; )
-	{
-		retired_list_node_t* n = (retired_list_node_t*)(h->list_entry.Next);
-		_aligned_free(h);
-		h = n;
-	}
-	_aligned_free(l->list);
 	_aligned_free(l);
 }
 
-void retired_list_push(retired_list_t* l, retired_data_t val)
+void retired_list_push(retired_list_t** l, retired_data_t val)
 {
-	retired_list_node_t* new_node = smr_alloc(sizeof(retired_list_node_t));
-	new_node->retired_data = val;
-	InterlockedPushEntrySList(l->list, &new_node->list_entry);
+	
+	if((*l)->retired_count == (*l)->maximum_size)
+	{
+		retired_list_t* new_list = new_retired_list();
+		new_list->retired_count = (*l)->retired_count;
+		memcpy(new_list->retired_list, (*l)->retired_list, (*l)->retired_count * sizeof(retired_data_t));
+	}
+	(*l)->retired_list[(*l)->retired_count++] = val;
 }
 
 retired_data_t retired_list_pop(retired_list_t* l)
 {
-	retired_list_node_t* old_node = (retired_list_node_t*)InterlockedPopEntrySList(l->list);
-	if(old_node != nullptr)
+	if(l->retired_count != 0)
 	{
-		retired_data_t rv = old_node->retired_data;
-		_aligned_free(old_node);
-		return rv;
+		return l->retired_list[--(l->retired_count)];
 	}
 	else
 	{
@@ -81,57 +86,53 @@ retired_data_t retired_list_pop(retired_list_t* l)
 	}
 }
 
+int __cdecl retired_data_compare(const void* lhs, const void* rhs)
+{
+	const retired_data_t* l = lhs;
+	const retired_data_t* r = rhs;
+	return (const char*)(r->node) - (const char*)(l->node);
+}
+
 bool retired_list_contains(retired_list_t* l, retired_data_t val)
 {
-	bool rv = false;
-	retired_list_node_t* h = nullptr;
-	// this is a pretty silly way of doing it
-	for(h = (retired_list_node_t*)InterlockedFlushSList(l->list); h != nullptr; h = (retired_list_node_t*)(h->list_entry.Next))
-	{
-		if(h->retired_data.node == val.node)
-		{
-			rv = true;
-		}
-		InterlockedPushEntrySList(l->list, &h->list_entry);
-	}
-	return rv;
+	qsort(l->retired_list, l->retired_count, sizeof(retired_data_t), &retired_data_compare);
+	return nullptr != bsearch(val.node, l->retired_list, l->retired_count, sizeof(retired_data_t), &retired_data_compare);
 }
 
-void retired_list_swap(retired_list_t* l, retired_list_t* r)
+LONG retired_list_count(retired_list_t* l)
 {
-	retired_list_t tmp;
-	tmp.list = l->list;
-	l->list = r->list;
-	r->list = tmp.list;
-}
-
-USHORT retired_list_count(retired_list_t* l)
-{
-	return QueryDepthSList(l->list);
+	return l->retired_count;
 }
 
 typedef struct hazard_pointer_record
 {
+#ifdef _DEBUG
+	char type[16];
+#endif
 	struct hazard_pointer_record* next;
 	volatile LONG active;
 	LONG count;
-	void* volatile hazard_pointers[1];
+	void* volatile hazard_pointers[0];
 } hazard_pointer_record_t;
+
+CACHE_ALIGN hazard_pointer_record_t* volatile head_hpr = nullptr;
 
 hazard_pointer_record_t* new_hpr(LONG count)
 {
-	hazard_pointer_record_t* hpr = smr_alloc(sizeof(hazard_pointer_record_t) + ((count - 1)* sizeof(void* volatile)));
-	memset(hpr, 0, sizeof(hazard_pointer_record_t) + ((count - 1) * sizeof(void* volatile)));
+	hazard_pointer_record_t* hpr = smr_alloc(sizeof(hazard_pointer_record_t) + (count* sizeof(void* volatile)));
+	memset(hpr, 0, sizeof(hazard_pointer_record_t) + (count* sizeof(void* volatile)));
 	hpr->count = count;
+#ifdef _DEBUG
+	strcat(hpr->type, "hzardpointerrec");
+#endif
 	return hpr;
 }
 
-CACHE_ALIGN hazard_pointer_record_t* volatile head_hpr = nullptr;
-CACHE_ALIGN volatile LONG total_hazard_pointers = 0;
-CACHE_ALIGN volatile LONG total_thread_records = 0;
-
 typedef struct hpr_cache
 {
+#ifdef _DEBUG
+	char type[16];
+#endif
 	hazard_pointer_record_t* record;
 	struct hpr_cache* next;
 } hpr_cache_t;
@@ -143,6 +144,9 @@ hpr_cache_t* new_hpr_cache(LONG count)
 	hpr_cache_t* hc = smr_alloc(sizeof(hpr_cache_t));
 	memset(hc, 0, sizeof(hpr_cache_t));
 	hc->record = allocate_hpr(count);
+#ifdef _DEBUG
+	strcat(hc->type, "hpr_cache");
+#endif
 	return hc;
 }
 
@@ -154,11 +158,14 @@ void delete_hpr_cache(hpr_cache_t* hc)
 	{
 		retire_hpr(hc->record);
 	}
-	smr_free(hc);
+	smr_retire(hc);
 }
 
 typedef struct thread_hpr_record
 {
+#ifdef _DEBUG
+	char type[16];
+#endif
 	// chaining/reclamation
 	struct thread_hpr_record* next;
 	volatile LONG active;
@@ -172,11 +179,13 @@ thread_hpr_record_t* new_thr()
 	thread_hpr_record_t* thr = smr_alloc(sizeof(thread_hpr_record_t));
 	memset(thr, 0, sizeof(thread_hpr_record_t));
 	thr->retired_list = new_retired_list();
+#ifdef _DEBUG
+	strcat(thr->type, "thread_hpr_rec");
+#endif
 	return thr;
 }
 
-CACHE_ALIGN thread_hpr_record_t* volatile head_thr = nullptr;
-volatile LONG maximum_threads = 0;
+static CACHE_ALIGN thread_hpr_record_t* volatile head_thr = nullptr;
 
 bool cas(volatile LONG* addr, LONG expected_value, LONG new_value)
 {
@@ -235,8 +244,7 @@ hazard_pointer_record_t* allocate_hpr(LONG count)
 
 void retire_hpr(hazard_pointer_record_t* hprec)
 {
-	int i = 0;
-	for(i = 0; i < hprec->count; ++i)
+	for(int i = 0; i < hprec->count; ++i)
 	{
 		hprec->hazard_pointers[i] = nullptr;
 	}
@@ -289,8 +297,7 @@ thread_hpr_record_t* get_mythrec()
 
 void retire_thr(thread_hpr_record_t* thr)
 {
-	hpr_cache_t* cache = thr->cache;
-	for(; cache != nullptr;)
+	for(hpr_cache_t* cache = thr->cache; cache != nullptr;)
 	{
 		hpr_cache_t* next = cache->next;
 		delete_hpr_cache(cache);
@@ -298,35 +305,34 @@ void retire_thr(thread_hpr_record_t* thr)
 	}
 	thr->cache = nullptr;
 	thr->active = 0;
+	delete_retired_list(thr->retired_list);
 }
 
 void scan(hazard_pointer_record_t* head)
 {
-	hazard_pointer_record_t* hprec = head;
 	retired_list_t* potentially_hazardous = new_retired_list();
-	retired_list_t* tmplist = new_retired_list();
-	retired_data_t node;
 
-	for(; hprec != nullptr; hprec = hprec->next)
+	for(hazard_pointer_record_t* hprec = head; hprec != nullptr; hprec = hprec->next)
 	{
-		int i = 0;
-		for(; i < hprec->count; ++i)
+		for(int i = 0; i < hprec->count; ++i)
 		{
 			MemoryBarrier();
 			if(hprec->hazard_pointers[i] != nullptr)
 			{
 				retired_data_t v = { hprec->hazard_pointers[i] };
-				retired_list_push(potentially_hazardous, v);
+				retired_list_push(&potentially_hazardous, v);
 			}
 		}
 	}
-	retired_list_swap(tmplist, get_mythrec()->retired_list);
-	node = retired_list_pop(tmplist);
+	retired_list_t* tmplist = get_mythrec()->retired_list;
+	get_mythrec()->retired_list = new_retired_list();
+
+	retired_data_t node = retired_list_pop(tmplist);
 	while(node.node != nullptr)
 	{
 		if(retired_list_contains(potentially_hazardous, node))
 		{
-			retired_list_push(get_mythrec()->retired_list, node);
+			retired_list_push(&(get_mythrec()->retired_list), node);
 		}
 		else
 		{
@@ -341,7 +347,7 @@ void scan(hazard_pointer_record_t* head)
 LONG R(long hh)
 {
 #ifdef _DEBUG
-	return 1;
+	return 0;
 #else
 	return 2 * hh;
 #endif
@@ -349,9 +355,7 @@ LONG R(long hh)
 
 void help_scan()
 {
-	thread_hpr_record_t* threc = nullptr;
-	hazard_pointer_record_t* head = nullptr;
-	for(threc = head_thr; threc != nullptr; threc = threc->next)
+	for(thread_hpr_record_t* threc = head_thr; threc != nullptr; threc = threc->next)
 	{
 		if(threc->active)
 		{
@@ -364,8 +368,8 @@ void help_scan()
 		while(retired_list_count(threc->retired_list) > 0)
 		{
 			retired_data_t node = retired_list_pop(threc->retired_list);
-			retired_list_push(get_mythrec()->retired_list, node);
-			head = head_hpr;
+			retired_list_push(&(get_mythrec()->retired_list), node);
+			hazard_pointer_record_t* head = head_hpr;
 			if(retired_list_count(get_mythrec()->retired_list) >= R(total_hazard_pointers))
 			{
 				scan(head);
@@ -378,7 +382,7 @@ void help_scan()
 void retire_node(retired_data_t node)
 {
 	hazard_pointer_record_t* head = head_hpr;
-	retired_list_push(get_mythrec()->retired_list, node);
+	retired_list_push(&(get_mythrec()->retired_list), node);
 	if(retired_list_count(get_mythrec()->retired_list) >= R(total_hazard_pointers))
 	{
 		scan(head);
@@ -395,14 +399,25 @@ void* smr_alloc(size_t size)
 
 void smr_free(void* ptr)
 {
+	_aligned_free(ptr);
+}
+
+void smr_retire(void* ptr)
+{
 	retired_data_t node = { ptr };
 	retire_node(node);
 }
 
-void smr_free_with_finalizer(void* ptr, finalizer_function_t finalizer, void* finalizer_context)
+void smr_retire_with_finalizer(void* ptr, finalizer_function_t finalizer, void* finalizer_context)
 {
 	retired_data_t node = { ptr, finalizer, finalizer_context };
 	retire_node(node);
+}
+
+void smr_clean()
+{
+	hazard_pointer_record_t* head = head_hpr;
+	scan(head);
 }
 
 void* allocate_hazard_pointers(LONG count, void* volatile** pointers)
@@ -416,6 +431,7 @@ void* allocate_hazard_pointers(LONG count, void* volatile** pointers)
 		if(cache->record != nullptr && !cache->record->active && cache->record->count >= count)
 		{
 			hprec = cache->record;
+			break;
 		}
 	}
 	if(!hprec)
