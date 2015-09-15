@@ -5,57 +5,12 @@
 #include <new>
 #include <memory>
 #include <type_traits>
+#include <atomic>
 
 namespace smr {
 	namespace detail {
 #include "smr.h"
 	}
-
-	namespace util {
-		template<typename T>
-		inline bool cas(T* volatile* addr, T* expected_value, T* new_value)
-		{
-			T* previous_value = static_cast<T*>(InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(addr), new_value, expected_value));
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(int volatile* addr, int expected_value, int new_value)
-		{
-			int previous_value = InterlockedCompareExchange(reinterpret_cast<long volatile*>(addr), static_cast<long>(new_value), static_cast<long>(expected_value));
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(unsigned int volatile* addr, unsigned int expected_value, unsigned int new_value)
-		{
-			unsigned int previous_value = InterlockedCompareExchange(addr, new_value, expected_value);
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(long volatile* addr, long expected_value, long new_value)
-		{
-			long previous_value = InterlockedCompareExchange(addr, new_value, expected_value);
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(unsigned long volatile* addr, unsigned long expected_value, unsigned long new_value)
-		{
-			unsigned long previous_value = InterlockedCompareExchange(addr, new_value, expected_value);
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(long long volatile* addr, long long expected_value, long long new_value)
-		{
-			long long previous_value = InterlockedCompareExchange64(addr, new_value, expected_value);
-			return expected_value == previous_value;
-		}
-
-		inline bool cas(unsigned long long volatile* addr, unsigned long long expected_value, unsigned long long new_value)
-		{
-			unsigned long long previous_value = InterlockedCompareExchange(addr, new_value, expected_value);
-			return expected_value == previous_value;
-		}
-	}
-
 
 	template<size_t N>
 	struct hazard_pointers {
@@ -94,11 +49,41 @@ namespace smr {
 		typedef stable_pointer<T> my_type;
 		typedef typename std::remove_const<T>::type bare_type;
 
+		explicit stable_pointer(std::atomic<T*>& location) : pointer(nullptr), hazard(new hazard_pointers<1>()) {
+			(*this) = location;
+		}
+
+		explicit stable_pointer(std::atomic<void*>& location) : pointer(nullptr), hazard(new hazard_pointers<1>()) {
+			(*this) = location;
+		}
+
 		explicit stable_pointer(T* volatile* location) : pointer(nullptr), hazard(new hazard_pointers<1>()) {
 			(*this) = location;
 		}
 
 		stable_pointer() : pointer(nullptr), hazard(new hazard_pointers<1>()) {
+		}
+
+		my_type& operator=(std::atomic<void*>& location) {
+			for(;;) {
+				pointer = static_cast<T*>(location.load(std::memory_order_acquire));
+				(*hazard)[0] = align_pointer(const_cast<bare_type*>(pointer));
+				if(pointer == static_cast<T*>(location.load(std::memory_order_acquire))) {
+					break;
+				}
+			}
+			return *this;
+		}
+
+		my_type& operator=(std::atomic<T*>& location) {
+			for(;;) {
+				pointer = location.load(std::memory_order_acquire);
+				(*hazard)[0] = align_pointer(const_cast<bare_type*>(pointer));
+				if(pointer == location.load(std::memory_order_acquire)) {
+					break;
+				}
+			}
+			return *this;
 		}
 
 		my_type& operator=(T* volatile* location) {
@@ -115,7 +100,7 @@ namespace smr {
 		// assign a pointer known to be unique and valid and/or persistent
 		void unshared_assign(pointer_type ptr) {
 			pointer = ptr;
-			(*hazard)[0] = align_pointer(ptr);
+			(*hazard)[0] = align_pointer(const_cast<bare_type*>(pointer));
 		}
 
 		pointer_type& get_pointer() {

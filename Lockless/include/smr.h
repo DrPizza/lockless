@@ -28,6 +28,9 @@ void smr_retire(void* ptr);
 void smr_retire_with_finalizer(void* ptr, finalizer_function_t finalizer, void* finalizer_context);
 void smr_free(void* ptr);
 void smr_clean();
+void smr_unsafe_full_clean();
+
+void report_remaining_objects();
 
 void* allocate_hazard_pointers(LONG count, void* volatile** pointers);
 void deallocate_hazard_pointers(void* key);

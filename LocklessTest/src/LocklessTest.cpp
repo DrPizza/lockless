@@ -16,7 +16,8 @@ _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);\
 _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDOUT);\
 _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);\
 _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDOUT);\
-SET_CRT_DEBUG_FIELD(_CRTDBG_LEAK_CHECK_DF);
+SET_CRT_DEBUG_FIELD(_CRTDBG_LEAK_CHECK_DF);\
+SET_CRT_DEBUG_FIELD(_CRTDBG_CHECK_ALWAYS_DF);
 
 //SET_CRT_DEBUG_FIELD(_CRTDBG_DELAY_FREE_MEM_DF);\
 //SET_CRT_DEBUG_FIELD(_CRTDBG_CHECK_EVERY_16_DF)
@@ -54,7 +55,7 @@ struct thread_info {
 	counter_t* counters;
 };
 
-static const __declspec(align(64)) unsigned __int64 target = 1000 * 1000 * 1;
+static const __declspec(align(64)) unsigned __int64 target = 512 * 1024;
 
 DWORD WINAPI thread_proc(void* data) {
 	thread_info* ti = static_cast<thread_info*>(data);
@@ -80,7 +81,7 @@ DWORD WINAPI naive_thread_proc(void* data) {
 
 DWORD WINAPI test_thread(void*)
 {
-	for(int i = 0; i < 64; ++i)
+	for(int i = 0; i < 1; ++i)
 	{
 		typedef non_blocking_unordered_map<std::string, std::string> map_type;
 		non_blocking_unordered_map<std::string, std::string>* m(new (smr::smr) map_type());
@@ -192,18 +193,11 @@ int main(int, char*[])
 
 	USES_MEMORY_CHECK;
 	MEM_CHK_BEFORE;
-	//_CrtSetBreakAlloc(179);
+	//_CrtSetBreakAlloc(161);
 	HANDLE test = CreateThread(nullptr, 0, &test_thread, nullptr, 0, nullptr);
 	WaitForSingleObject(test, INFINITE);
-	MEM_CHK_AFTER;
-
-	_CrtDumpMemoryLeaks();
-
-	char ch;
-	std::cin >> ch;
-
-	return 0;
-	for(;;)
+goto end;
+	for(int j = 0; j < 1; ++j)
 	{
 		interlocked_counter = 0;
 		::SetPriorityClass(::GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
@@ -262,5 +256,13 @@ int main(int, char*[])
 		::CloseHandle(begin);
 		smr::smr_destroy(counters);
 	}
+
+end:
+	smr::detail::smr_unsafe_full_clean();
+	MEM_CHK_AFTER;
+	_CrtDumpMemoryLeaks();
+	std::cout << "all done" << std::endl;
+	char ch;
+	std::cin >> ch;
 	return 0;
 }

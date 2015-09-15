@@ -7,13 +7,14 @@
 #include <new>
 #include <ctime>
 #include <unordered_map>
+#include <atomic>
 
 #include <boost/noncopyable.hpp>
 
 template<typename T>
 struct array : smr::smr_destructible, boost::noncopyable {
-	typedef T element_type;
-	typedef array<element_type> array_type;
+	typedef std::atomic<T> element_type;
+	typedef array<T> array_type;
 
 	array(size_t length_) : length(length_), values(new (smr::smr) element_type[length]) {
 	}
@@ -107,13 +108,13 @@ struct concurrent_auto_table : smr::smr_destructible, boost::noncopyable {
 
 		CAT* cat = nullptr;
 		for(;;) {
-			cat = _cat;
-			hazards[0] = _cat;
-			if(cat != _cat) {
+			cat = _cat.load();
+			hazards[0] = cat;
+			if(cat != _cat.load()) {
 				continue;
 			}
 			// Spin until CAS works
-			if(!smr::util::cas(&_cat, cat, newcat)) {
+			if(!_cat.compare_exchange_strong(cat, newcat)) {
 				continue;
 			}
 			smr::smr_destroy(cat);
@@ -129,9 +130,9 @@ struct concurrent_auto_table : smr::smr_destructible, boost::noncopyable {
 
 		CAT* cat = nullptr;
 		for(;;) {
-			cat = _cat;
+			cat = _cat.load();
 			hazards[0] = cat;
-			if(cat == _cat) {
+			if(cat == _cat.load()) {
 				break;
 			}
 		}
@@ -145,9 +146,9 @@ struct concurrent_auto_table : smr::smr_destructible, boost::noncopyable {
 
 		CAT* cat = nullptr;
 		for(;;) {
-			cat = _cat;
+			cat = _cat.load();
 			hazards[0] = cat;
-			if(cat == _cat) {
+			if(cat == _cat.load()) {
 				break;
 			}
 		}
@@ -156,14 +157,14 @@ struct concurrent_auto_table : smr::smr_destructible, boost::noncopyable {
 
 protected:
 	~concurrent_auto_table() {
-		smr::smr_destroy(_cat);
+		smr::smr_destroy(_cat.load());
 	}
 
 private:
 	friend struct CAT;
 	struct CAT : smr::smr_destructible, boost::noncopyable {
 		CAT(CAT* next, size_t sz, integer_type init) : _next(next), _t(new (smr::smr) array_type(sz)), _sum_cache(std::numeric_limits<integer_type>::min()) {
-			_t->values[0] = init;
+			_t.load()->values[0] = init;
 		}
 
 		virtual smr::smr_destructible::finalizer_function_t get_finalizer() const {
@@ -187,15 +188,15 @@ private:
 			array_type* t = nullptr;
 			// get a stable read of the array
 			for(;;) {
-				t = _t;
-				hazards[0] = _t;
-				if(t == _t) {
+				t = _t.load();
+				hazards[0] = t;
+				if(t == _t.load()) {
 					break;
 				}
 			}
 			size_t idx = hash & (t->length - 1);
 			// Peel loop; try once fast
-			integer_type old = t->values[idx];
+			integer_type old = t->values[idx].load();
 			bool ok = CAS(t->values, idx, old & ~mask, old + x);
 			if(_sum_cache != std::numeric_limits<integer_type>::min()) {
 				_sum_cache = std::numeric_limits<integer_type>::min(); // Blow out cache
@@ -207,29 +208,20 @@ private:
 				return old; // Failed for bit-set under mask
 			}
 			// Try harder
-			size_t cnt = 0;
-			for(;;) {
-				old = t->values[idx];
-				if((old & mask) != 0) {
-					return old; // Failed for bit-set under mask
-				}
-				if(CAS(t->values, idx, old, old + x)) {
-					break; // Got it!
-				}
-				++cnt;
+			old = t->values[idx].load();
+			if((old & mask) != 0) {
+				return old; // Failed for bit-set under mask
 			}
-			if(cnt < MAX_SPIN) {
-				return old; // Allowable spin loop count
-			}
+			t->values[idx].fetch_add(x);
 			if(t->length >= 1024 * 1024) {
-				return old; // too big already
+				return t->values[idx].load(); // too big already
 			}
 
 			// Too much contention; double array size in an effort to reduce contention
-			size_t r = _resizers;
+			size_t r = _resizers.load();
 			size_t newbytes = (t->length << 1) << sizeof(integer_type); // word to bytes
-			while(!smr::util::cas(&_resizers, r, r + newbytes)) {
-				r = _resizers;
+			while(!_resizers.compare_exchange_strong(r, r + newbytes)) {
+				r = _resizers.load();
 			}
 			r += newbytes;
 			if(master->_cat != this) {
@@ -268,14 +260,14 @@ private:
 			array_type* t = nullptr;
 			// get a stable read of the array
 			for(;;) {
-				t = _t;
-				hazards[0] = _t;
-				if(t == _t) {
+				t = _t.load();
+				hazards[0] = t;
+				if(t == _t.load()) {
 					break;
 				}
 			}
 			for(size_t i = 0; i < t->length; ++i) {
-				sum += t->values[i] & ~mask;
+				sum += t->values[i].load() & ~mask;
 			}
 			_sum_cache = sum; // Cache includes recursive counts
 			return sum;
@@ -285,7 +277,7 @@ private:
 		// the cache.
 		integer_type estimate_sum(integer_type mask) const {
 			// For short tables, just do the work
-			if(_t->length <= 64) {
+			if(_t.load()->length <= 64) {
 				return sum(mask);
 			}
 			// For bigger tables, periodically freshen a cached value
@@ -304,19 +296,15 @@ private:
 			array_type* t = nullptr;
 			// get a stable read of the array
 			for(;;) {
-				t = _t;
-				hazards[0] = _t;
-				if(t == _t) {
+				t = _t.load();
+				hazards[0] = t;
+				if(t == _t.load()) {
 					break;
 				}
 			}
 
 			for(size_t i = 0; i < t->length; ++i) {
-				bool done = false;
-				while(!done) {
-					integer_type old = t->values[i];
-					done = CAS(t->values, i, old, old | mask);
-				}
+				t->values[i].fetch_or(mask);
 			}
 			if(_next != nullptr) {
 				_next->all_or(mask);
@@ -332,19 +320,15 @@ private:
 			array_type* t = nullptr;
 			// get a stable read of the array
 			for(;;) {
-				t = _t;
-				hazards[0] = _t;
-				if(t == _t) {
+				t = _t.load();
+				hazards[0] = t;
+				if(t == _t.load()) {
 					break;
 				}
 			}
 
 			for(size_t i = 0; i < t->length; ++i) {
-				bool done = false;
-				while(!done) {
-					integer_type old = t->values[i];
-					done = CAS(t->values, i, old, old & mask);
-				}
+				t->values[i].fetch_and(mask);
 			}
 			if(_next != nullptr) {
 				_next->all_and(mask);
@@ -361,15 +345,15 @@ private:
 			array_type* t = nullptr;
 			// get a stable read of the array
 			for(;;) {
-				t = _t;
-				hazards[0] = _t;
-				if(t == _t) {
+				t = _t.load();
+				hazards[0] = t;
+				if(t == _t.load()) {
 					break;
 				}
 			}
 
 			for(size_t i = 0; i < t->length; ++i) {
-				t->values[i] = val;
+				t->values[i].store(val);
 			}
 
 			if(_next != nullptr) {
@@ -385,12 +369,12 @@ private:
 			if(_next != nullptr) {
 				smr::smr_destroy(_next);
 			}
-			smr::smr_destroy(_t);
+			smr::smr_destroy(_t.load());
 		}
 
 	private:
-		static bool CAS(integer_type* A, size_t idx, integer_type old, integer_type nnn) {
-			return smr::util::cas(&A[idx], old, nnn);
+		static bool CAS(std::atomic<integer_type>* A, size_t idx, integer_type old, integer_type nnn) {
+			return A[idx].compare_exchange_strong(old, nnn);
 		}
 
 		CAT* _next;
@@ -398,11 +382,11 @@ private:
 		mutable volatile integer_type _sum_cache;
 		mutable volatile integer_type _fuzzy_sum_cache;
 		mutable volatile std::clock_t _fuzzy_time;
-		volatile size_t _resizers; // count of threads attempting a resize
+		std::atomic<size_t> _resizers; // count of threads attempting a resize
 
 		static const size_t MAX_SPIN = 2;
 
-		array_type* const volatile _t; // Power-of-2 array of integer_types
+		std::atomic<array_type*> _t; // Power-of-2 array of integer_types
 	};
 
 	hash_type hasher;
@@ -415,7 +399,7 @@ private:
 	}
 
 	// The underlying array of concurrently updated long counters
-	CACHE_ALIGN CAT* volatile _cat;
+	CACHE_ALIGN std::atomic<CAT*> _cat;
 
 	// Only add 'x' to some slot in table, hinted at by 'hash', if bits under
 	// the mask are all zero. The sum can overflow or 'x' can contain bits in
@@ -428,9 +412,9 @@ private:
 
 		CAT* cat = nullptr;
 		for(;;) {
-			cat = _cat;
-			hazards[0] = _cat;
-			if(cat == _cat) {
+			cat = _cat.load();
+			hazards[0] = cat;
+			if(cat == _cat.load()) {
 				break;
 			}
 		}
@@ -438,7 +422,7 @@ private:
 	}
 
 	bool CAS_cat(CAT* oldcat, CAT* newcat) {
-		return smr::util::cas(&_cat, oldcat, newcat);
+		return _cat.compare_exchange_strong(oldcat, newcat);
 	}
 };
 
